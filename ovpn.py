@@ -33,14 +33,19 @@ async def get_ip_geo(client: httpx.AsyncClient, ip: str, *, sleep: float = 10) -
 		except httpx.HTTPError:
 			await asyncio.sleep(sleep)
 
-async def download(client: httpx.AsyncClient, path: str, url: str):
-	name = url.split('/')[-1]
-	geo, file = await asyncio.gather(get_ip_geo(client, name.split('_')[0]), client.get(url))
-	geo = geo_format(geo)
-	path = path.format(country=geo["country"],region=geo["regionName"],city=geo["city"])
-	await aiofiles.os.makedirs(path, exist_ok=True)
-	async with aiofiles.open(path + os.sep + name, mode='w') as handle:
-		await handle.write(file.text)
+async def download(client: httpx.AsyncClient, path: str, url: str, *, sleep: float = 10):
+	while True:
+		try:
+			name = url.split('/')[-1]
+			geo, file = await asyncio.gather(get_ip_geo(client, name.split('_')[0]), client.get(url))
+			geo = geo_format(geo)
+			path = path.format(country=geo["country"],region=geo["regionName"],city=geo["city"])
+			await aiofiles.os.makedirs(path, exist_ok=True)
+			async with aiofiles.open(path + os.sep + name, mode='w') as handle:
+				await handle.write(file.text)
+			return
+		except httpx.HTTPError:
+			await asyncio.sleep(sleep)
 
 async def check(path: str, *queries: str):
 	queries = {q.split('=')[0]: q.split('=')[1] for q in queries}
@@ -48,7 +53,7 @@ async def check(path: str, *queries: str):
 	region = queries.get("region")
 	city = queries.get("city")
 	tasks = []
-	async with httpx.AsyncClient(headers=headers) as client:
+	async with httpx.AsyncClient(headers=headers, timeout=30) as client:
 		for root, folder, files in os.walk(path):
 			for file in files:
 				ip = file.split('_')[0]
@@ -58,15 +63,13 @@ async def check(path: str, *queries: str):
 		geos = await asyncio.gather(*tasks)
 	for geo in geos:
 		geo = geo_format(geo)
-		try:
-			if country == geo["country"] or region == geo["regionName"] or city == geo["city"]:
-				print(geo["query"])
-		except KeyError: pass
+		if country == geo["country"] or region == geo["regionName"] or city == geo["city"]:
+			print(geo["query"])
 
 async def get(url: str, path: str):
 	url = urlparse(url)
 	tasks = []
-	async with httpx.AsyncClient(headers=headers) as client:
+	async with httpx.AsyncClient(headers=headers, timeout=30) as client:
 		page = await client.get(url.geturl())
 		soup = bs4.BeautifulSoup(page.text, "lxml")
 		for link in soup.find_all('a'):
