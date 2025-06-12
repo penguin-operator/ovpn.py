@@ -2,83 +2,109 @@
 import httpx
 import bs4
 import asyncio
+import random
 import sys
 import os
 import os.path
 import aiofiles
 import aiofiles.os
-from urllib.parse import urlparse
+from urllib.parse import urlparse, ParseResult
 
-cache = {
-	"ip_geo": dict[str, dict[str, str | float | bool]](),
-	"ips": list[str](),
-}
-headers = {
-	"user-agent": "Firefox/136.0",
-}
+class cache:
+	geos: dict[str, dict[str, str | float | bool]] = {}
+	urls: list[str] = []
+	ips: list[str] = []
 
-def geo_format(geo: dict[str, str | float | bool]) -> dict[str, str | float | bool]:
+def genheaders() -> dict[str, str]:
+	return {
+		"user-agent": f"Firefox/{random.randint(100, 200)}",
+	}
+
+def urlformat(url: str, current: ParseResult = None) -> ParseResult:
+	url = urlparse(url)._replace(scheme=current.scheme, netloc=current.netloc)
+	return url
+
+def geoformat(geo: dict[str, str | float | bool]) -> dict[str, str | float | bool]:
 	geo["country"] = geo["country"].replace(' ', '_').lower()
-	geo["regionName"] = geo["regionName"].replace(' ', '_').lower()
+	geo["region"] = geo["regionName"].replace(' ', '_').lower()
 	geo["city"] = geo["city"].replace(' ', '_').lower()
 	return geo
 
-async def get_ip_geo(client: httpx.AsyncClient, ip: str, *, sleep: float = 5) -> dict[str, float | str | bool]:
-	if ip in cache["ip_geo"].keys(): return cache["ip_geo"][ip]
-	while True:
-		try:
-			response = await client.get(f"http://ip-api.com/json/{ip}")
-			if response.status_code != 200: await asyncio.sleep(sleep)
-			else: return response.json()
-		except httpx.HTTPError:
-			await asyncio.sleep(sleep)
+def matches(geo: dict[str, str | float | bool], queries: dict[str, str | float | bool]) -> bool:
+	for k, _ in zip(queries.keys(), geo.keys()):
+		if queries[k] != geo[k]: return False
+	return True
 
-async def download(client: httpx.AsyncClient, path: str, url: str, *, sleep: float = 10):
-	while True:
+async def getgeo(client: httpx.AsyncClient, ip: str, *, api: str = "http://ip-api.com/json/{}", delay: float = 10) -> dict[str, str | float | bool]:
+	if ip in cache.geos: return cache.geos[ip]
+	data = None
+	while not data:
 		try:
-			name = url.split('/')[-1]
-			geo, file = await asyncio.gather(get_ip_geo(client, name.split('_')[0]), client.get(url))
+			response = await client.get(api.format(ip))
+			if response.status_code != 200: await asyncio.sleep(delay)
+			else: data = cache.geos[ip] = response.json()
+		except httpx.HTTPError:
+			await asyncio.sleep(delay)
+	return cache.geos[ip]
+
+async def scan(client: httpx.AsyncClient, url: ParseResult) -> list[str]:
+	if url.geturl() in cache.urls: return []
+	global scan
+	scans = []
+	files = []
+	page = await client.get(url.geturl())
+	soup = bs4.BeautifulSoup(page.text, "lxml")
+	for link in soup.find_all('a'):
+		link = urlformat(link.get("href"), url)
+		if link.geturl() in cache.urls: continue
+		if link.path.endswith(".ovpn"): files += [link.geturl()]
+		elif link.path == "": scans += [scan(client, link._replace(path=url.path))]
+		cache.urls += [link.geturl()]
+	for scan in await asyncio.gather(*scans):
+		files += scan
+	return files
+
+async def download(client: httpx.AsyncClient, url: str, path: str, *, delay: float = 10) -> None:
+	name = url.split('/')[-1]
+	ip = name.split('_')[-3]
+	handle = None
+	while not handle:
+		try:
+			geo, file = await asyncio.gather(getgeo(client, ip), client.get(url))
 			if file.status_code != 200: return
-			geo = geo_format(geo)
-			path = path.format(country=geo["country"],region=geo["regionName"],city=geo["city"])
+			cache.geos[ip] = geo = geoformat(geo)
+			path = path.format(country=geo["country"], region=geo["region"], city=geo["city"])
 			await aiofiles.os.makedirs(path, exist_ok=True)
-			async with aiofiles.open(path + os.sep + name, mode='w') as handle:
-				await handle.write(file.text)
-			return
+			async with aiofiles.open(path + os.sep + name, mode='wb') as handle:
+				await handle.write(file.content)
 		except httpx.HTTPError:
-			await asyncio.sleep(sleep)
+			await asyncio.sleep(delay)
 
-async def check(path: str, *queries: str):
-	queries = {q.split('=')[0]: q.split('=')[1] for q in queries}
-	country = queries.get("country")
-	region = queries.get("region")
-	city = queries.get("city")
-	tasks = []
-	async with httpx.AsyncClient(headers=headers, timeout=60) as client:
-		for root, folder, files in os.walk(path):
-			for file in files:
-				ip = file.split('_')[0]
-				if ip in cache["ips"]: continue 
-				tasks += [get_ip_geo(client, ip)]
-				cache["ips"] += [ip]
-		geos = await asyncio.gather(*tasks)
-	for geo in geos:
-		geo = geo_format(geo)
-		if country == geo["country"] or region == geo["regionName"] or city == geo["city"]:
-			print(geo["query"])
-
-async def get(url: str, path: str):
+async def get(url: str, path: str) -> None:
 	url = urlparse(url)
 	tasks = []
-	async with httpx.AsyncClient(headers=headers, timeout=60) as client:
-		page = await client.get(url.geturl())
-		soup = bs4.BeautifulSoup(page.text, "lxml")
-		for link in soup.find_all('a'):
-			link = urlparse(link.get("href"))._replace(scheme = url.scheme, netloc = url.netloc)
-			if link.path.endswith(".ovpn"): tasks += [download(client, path, link.geturl())]
+	async with httpx.AsyncClient(headers=genheaders(), timeout=60) as client:
+		servers = await scan(client, url)
+		for server in servers:
+			tasks += [download(client, server, path)]
 		await asyncio.gather(*tasks)
+
+async def check(path: str, *queries: str) -> None:
+	queries = {s[0]: s[1] for q in queries if (s := q.split('='))}
+	geos = []
+	async with httpx.AsyncClient(headers=genheaders(), timeout=60) as client:
+		for root, folder, files in os.walk(path):
+			for file in files:
+				ip = file.split('_')[-3]
+				if ip in cache.ips: continue
+				geos += [getgeo(client, ip)]
+				cache.ips += [ip]
+		geos = await asyncio.gather(*geos)
+	for geo in geos:
+		if matches(geoformat(geo), queries):
+			print(geo["query"])
 
 if __name__ == "__main__":
 	match sys.argv[1:]:
-		case ["check", path, query, *queries]: asyncio.run(check(path, query, *queries))
 		case ["get", url, path]: asyncio.run(get(url, path))
+		case ["check", path, *queries]: asyncio.run(check(path, *queries))
