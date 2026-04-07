@@ -1,4 +1,4 @@
-#!/usr/bin/python3.13
+#!/usr/bin/python3
 import httpx
 import bs4
 import asyncio
@@ -95,7 +95,7 @@ async def download(client: httpx.AsyncClient, url: ParseResult, path: str, *, de
 			name = f"{ip}_{proto}_{port}.ovpn"
 			await aiofiles.os.makedirs(path, exist_ok=True)
 			async with aiofiles.open(path + os.sep + name, mode='wb') as handle:
-				await handle.write(file.content)
+				await handle.write(file.content.replace(b"persist-tun", b""))
 		except httpx.HTTPError:
 			await asyncio.sleep(delay)
 
