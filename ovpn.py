@@ -8,11 +8,11 @@ import os
 import os.path
 import aiofiles
 import aiofiles.os
-from urllib.parse import urlparse, ParseResult
+from urllib.parse import urlparse, ParseResult, ParseResultBytes
 
 class cache:
 	geos: dict[str, dict[str, str | float | bool]] = {}
-	urls: list[str] = []
+	urls: list[ParseResult] = []
 	ips: list[str] = []
 
 def genheaders() -> dict[str, str]:
@@ -21,7 +21,10 @@ def genheaders() -> dict[str, str]:
 	}
 
 def urlformat(url: str, current: ParseResult = None) -> ParseResult:
-	url = urlparse(url)._replace(scheme=current.scheme, netloc=current.netloc)
+	url = urlparse(url)
+	if url.__class__ == ParseResultBytes: url = url.decode()
+	url = url._replace(scheme=current.scheme, netloc=current.netloc)
+	if url.path == "": url = url._replace(path=current.path)
 	return url
 
 def geoformat(geo: dict[str, str | float | bool]) -> dict[str, str | float | bool]:
@@ -35,6 +38,14 @@ def matches(geo: dict[str, str | float | bool], queries: dict[str, str | float |
 		if queries[k] != geo[k]: return False
 	return True
 
+def getvpndata(file: str) -> tuple[str, str, int]:
+	tokens = [l.replace('\r', '').split(' ') for l in file.split('\n')]
+	ip, proto, port = None, None, None
+	for line in tokens:
+		if line[0] == "proto": proto = line[1]
+		elif line[0] == "remote": ip, port = line[1], int(line[2])
+	return ip, proto, port
+
 async def getgeo(client: httpx.AsyncClient, ip: str, *, api: str = "http://ip-api.com/json/{}", delay: float = 10) -> dict[str, str | float | bool]:
 	if ip in cache.geos: return cache.geos[ip]
 	data = None
@@ -47,33 +58,41 @@ async def getgeo(client: httpx.AsyncClient, ip: str, *, api: str = "http://ip-ap
 			await asyncio.sleep(delay)
 	return cache.geos[ip]
 
-async def scan(client: httpx.AsyncClient, url: ParseResult) -> list[str]:
-	if url.geturl() in cache.urls: return []
+async def scan(client: httpx.AsyncClient, url: ParseResult) -> list[ParseResult]:
+	if url in cache.urls: return []
+	cache.urls += [url]
 	global scan
 	scans = []
 	files = []
-	page = await client.get(url.geturl())
+	try:
+		page = await client.get(url.geturl())
+	except httpx.HTTPError:
+		return []
+	if not page.headers["content-type"].startswith("text/html"):
+		return []
 	soup = bs4.BeautifulSoup(page.text, "lxml")
 	for link in soup.find_all('a'):
 		link = urlformat(link.get("href"), url)
-		if link.geturl() in cache.urls: continue
-		if link.path.endswith(".ovpn"): files += [link.geturl()]
-		elif link.path == "": scans += [scan(client, link._replace(path=url.path))]
-		cache.urls += [link.geturl()]
-	for scan in await asyncio.gather(*scans):
-		files += scan
+		if link in cache.urls or link.netloc != url.netloc: continue
+		if link.path.endswith(".ovpn"):
+			cache.urls += [link]
+			files += [link]
+		else: scans += [scan(client, link)]
+	for scanned in await asyncio.gather(*scans):
+		files += scanned
 	return files
 
-async def download(client: httpx.AsyncClient, url: str, path: str, *, delay: float = 10) -> None:
-	name = url.split('/')[-1]
-	ip = name.split('_')[-3]
+async def download(client: httpx.AsyncClient, url: ParseResult, path: str, *, delay: float = 10) -> None:
 	handle = None
 	while not handle:
 		try:
-			geo, file = await asyncio.gather(getgeo(client, ip), client.get(url))
+			file = await client.get(url.geturl())
 			if file.status_code != 200: return
+			ip, proto, port = getvpndata(file.text)
+			geo = await getgeo(client, ip)
 			cache.geos[ip] = geo = geoformat(geo)
 			path = path.format(country=geo["country"], region=geo["region"], city=geo["city"])
+			name = f"{ip}_{proto}_{port}.ovpn"
 			await aiofiles.os.makedirs(path, exist_ok=True)
 			async with aiofiles.open(path + os.sep + name, mode='wb') as handle:
 				await handle.write(file.content)
@@ -83,7 +102,7 @@ async def download(client: httpx.AsyncClient, url: str, path: str, *, delay: flo
 async def get(url: str, path: str) -> None:
 	url = urlparse(url)
 	tasks = []
-	async with httpx.AsyncClient(headers=genheaders(), timeout=60) as client:
+	async with httpx.AsyncClient(headers=genheaders(), timeout=300) as client:
 		servers = await scan(client, url)
 		for server in servers:
 			tasks += [download(client, server, path)]
